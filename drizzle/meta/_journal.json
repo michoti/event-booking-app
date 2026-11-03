@@ -5,8 +5,15 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1793549519185,
-      "tag": "0000_groovy_bedlam",
+      "when": 1793601799295,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793601930801,
+      "tag": "0001_hardening",
       "breakpoints": true
     }
   ]
