@@ -1,7 +1,5 @@
--- Paste into the migration created by:
---   drizzle-kit generate --custom --name=hardening
--- Things Drizzle's schema DSL cannot express: triggers, append-only audit log,
--- and the baseline RBAC seed. Statement breakpoints are required by drizzle-kit.
+-- Audit triggers, append-only audit log, default role, RBAC seed (from your hardening.sql), plus RLS lockdown.
+
 
 -- ---------------------------------------------------------------------------
 -- 1. Audit trigger. The app sets the actor inside each transaction with:
@@ -126,4 +124,22 @@ INSERT INTO roles_permissions (role_id, permission_id)
 SELECT r.id, p.id FROM roles r JOIN permissions p ON p.key IN
   ('booking:create','booking:read:own','booking:cancel:own')
 WHERE r.name = 'attendee'
-ON CONFLICT DO NOTHING;
+ON CONFLICT DO NOTHING;--> statement-breakpoint
+
+-- ---------------------------------------------------------------------------
+-- 4. Lock down the Supabase Data API. We use Auth.js + a direct Postgres
+--    connection (owner role, bypasses RLS), so anon/authenticated must never
+--    reach these tables via PostgREST. RLS on + zero policies = deny by default.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE t text;
+BEGIN
+  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename NOT LIKE '\_\_drizzle%' LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+  END LOOP;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated';
+    EXECUTE 'REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated';
+  END IF;
+END $$;

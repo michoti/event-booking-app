@@ -68,6 +68,8 @@ CREATE TABLE "events" (
 	"ends_at" timestamp with time zone NOT NULL,
 	"timezone" varchar(64) NOT NULL,
 	"deleted_at" timestamp with time zone,
+	"embedding" vector(384),
+	"embedding_model" varchar(32),
 	"search_vector" "tsvector" GENERATED ALWAYS AS (setweight(to_tsvector('english', coalesce(title, '')), 'A') || setweight(to_tsvector('english', coalesce(description, '')), 'B')) STORED,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
@@ -208,6 +210,7 @@ CREATE INDEX "bookings_event_status_idx" ON "bookings" USING btree ("event_id","
 CREATE INDEX "bookings_pending_expiry_idx" ON "bookings" USING btree ("hold_expires_at") WHERE "bookings"."status" = 'pending';--> statement-breakpoint
 CREATE INDEX "events_search_gin" ON "events" USING gin ("search_vector");--> statement-breakpoint
 CREATE INDEX "events_published_starts_idx" ON "events" USING btree ("starts_at") WHERE "events"."status" = 'published' and "events"."deleted_at" is null;--> statement-breakpoint
+CREATE INDEX "events_embedding_hnsw" ON "events" USING hnsw ("embedding" vector_cosine_ops);--> statement-breakpoint
 CREATE INDEX "events_organizer_idx" ON "events" USING btree ("organizer_id");--> statement-breakpoint
 CREATE INDEX "events_venue_idx" ON "events" USING btree ("venue_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "payments_provider_ref_uq" ON "payments" USING btree ("provider","provider_payment_id");--> statement-breakpoint
