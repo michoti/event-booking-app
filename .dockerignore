@@ -17,3 +17,9 @@ compose*.yml
 .idea
 monitoring
 .DS_Store
+.data
+.env.local
+reports
+playwright-report
+test-results
+.github

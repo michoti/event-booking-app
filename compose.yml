@@ -1,263 +1,109 @@
 name: event-booking
 
-x-logging: &default-logging
+x-logging: &logging
   driver: json-file
-  options:
-    max-size: "10m"
-    max-file: "3"
+  options: { max-size: "10m", max-file: "3" }
 
+# `docker compose up -d`                  -> db + sweeper (run `npm run dev` on the host)
+# `docker compose --profile app up -d`    -> + migrate + production-mode app container
 services:
-  # ---------------------------------------------------------------------------
-  # Database
-  # ---------------------------------------------------------------------------
-  postgres:
-    image: postgres:18-alpine
-    container_name: eb-postgres
+  db:
+    # pgvector/pgvector ships the `vector` extension. pg_cron is a Supabase extension: locally the `sweeper` replaces it.
+    image: pgvector/pgvector:pg17
+    container_name: eb-db
     restart: unless-stopped
-    init: true
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
-      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:-eventbooking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-eventbooking}
       TZ: UTC
-    command:
-      - postgres
-      - -c
-      - max_connections=100
-      - -c
-      - shared_buffers=256MB
-      - -c
-      - log_min_duration_statement=500
+    command: ["postgres", "-c", "max_connections=100", "-c", "shared_buffers=128MB", "-c", "log_min_duration_statement=500"]
     volumes:
-      # PG 18 images keep PGDATA in a versioned subdir; mount the PARENT dir
-      # (/var/lib/postgresql), NOT /var/lib/postgresql/data, or you get startup errors.
-      - postgres_data:/var/lib/postgresql
+      - pgdata:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432" # localhost only (drizzle-kit studio, psql)
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 20s
-    stop_grace_period: 30s
+      retries: 10
+      start_period: 10s
     networks: [app-net]
-    logging: *default-logging
+    logging: *logging
 
-  # ---------------------------------------------------------------------------
-  # One-shot migrations (runs and exits; app waits for success)
-  # ---------------------------------------------------------------------------
+  # Local stand-in for pg_cron: calls the same SQL function every 30 seconds.
+  sweeper:
+    image: pgvector/pgvector:pg17
+    container_name: eb-sweeper
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until psql -h db -U $${POSTGRES_USER:-eventbooking} -d $${POSTGRES_DB:-eventbooking} -tAc "select to_regproc('sweep_expired') is not null" 2>/dev/null | grep -q t; do sleep 3; done
+        while true; do
+          psql -h db -U $${POSTGRES_USER:-eventbooking} -d $${POSTGRES_DB:-eventbooking} -tAc "select sweep_expired()" || true
+          sleep 30
+        done
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [app-net]
+    logging: *logging
+
   migrate:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: migrator
+    profiles: [app]
+    build: { context: ., target: migrator }
     image: event-booking-migrator:local
     container_name: eb-migrate
     restart: "no"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-eventbooking}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-eventbooking}
     depends_on:
-      postgres:
-        condition: service_healthy
+      db: { condition: service_healthy }
     networks: [app-net]
-    logging: *default-logging
+    logging: *logging
 
-  # ---------------------------------------------------------------------------
-  # Next.js application
-  # ---------------------------------------------------------------------------
   app:
+    profiles: [app]
     build:
       context: .
-      dockerfile: Dockerfile
       target: runner
-      args:
-        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
     image: event-booking-app:local
     container_name: eb-app
     restart: unless-stopped
-    init: true # proper PID 1 signal handling / zombie reaping
+    init: true
     environment:
       NODE_ENV: production
-      PORT: "3000"
-      HOSTNAME: 0.0.0.0
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      DB_POOL_MAX: ${DB_POOL_MAX:-10}
-      KAFKA_BROKERS: kafka:9092
-      KAFKA_CLIENT_ID: event-booking-app
-      METRICS_PORT: "9464"
-      AUTH_SECRET: ${AUTH_SECRET:?set in .env}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-eventbooking}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-eventbooking}
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET in .env}
       AUTH_URL: ${AUTH_URL:-http://localhost:3000}
       AUTH_TRUST_HOST: "true"
       AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID:-}
       AUTH_GOOGLE_SECRET: ${AUTH_GOOGLE_SECRET:-}
       AUTH_GITHUB_ID: ${AUTH_GITHUB_ID:-}
       AUTH_GITHUB_SECRET: ${AUTH_GITHUB_SECRET:-}
+      CRON_SECRET: ${CRON_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENABLE_METRICS: ${ENABLE_METRICS:-0}
+      METRICS_PORT: "9464"
     ports:
       - "${APP_PORT:-3000}:3000"
     depends_on:
-      migrate:
-        condition: service_completed_successfully
-      kafka:
-        condition: service_healthy
+      migrate: { condition: service_completed_successfully }
     read_only: true
     tmpfs:
       - /tmp
       - /app/.next/cache:uid=1000,gid=1000
     cap_drop: [ALL]
-    security_opt:
-      - no-new-privileges:true
-    stop_grace_period: 30s
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 768M
+    security_opt: ["no-new-privileges:true"]
+    deploy: { resources: { limits: { cpus: "1.0", memory: 768M } } }
     networks: [app-net, obs-net]
-    logging: *default-logging
-
-  # ---------------------------------------------------------------------------
-  # Kafka (single-node KRaft, no ZooKeeper)
-  # ---------------------------------------------------------------------------
-  kafka:
-    image: apache/kafka:4.0.0
-    container_name: eb-kafka
-    restart: unless-stopped
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?set in .env}
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
-    volumes:
-      - kafka_data:/var/lib/kafka/data
-    ports:
-      - "127.0.0.1:9094:9094" # host access for local tooling only
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
-    stop_grace_period: 60s
-    networks: [app-net]
-    logging: *default-logging
-
-  # Creates topics then exits (auto-create is disabled on purpose).
-  kafka-init:
-    image: apache/kafka:4.0.0
-    container_name: eb-kafka-init
-    restart: "no"
-    depends_on:
-      kafka:
-        condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        for t in booking.created booking.cancelled event.updated; do
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
-            --create --if-not-exists --topic "$$t" --partitions 3 --replication-factor 1
-        done
-    networks: [app-net]
-    logging: *default-logging
-
-  # ---------------------------------------------------------------------------
-  # Observability
-  # ---------------------------------------------------------------------------
-  prometheus:
-    image: prom/prometheus:v3.5.0
-    container_name: eb-prometheus
-    restart: unless-stopped
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=15d
-      - --web.enable-lifecycle
-    volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    ports:
-      - "127.0.0.1:9090:9090"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    networks: [obs-net]
-    logging: *default-logging
-
-  grafana:
-    image: grafana/grafana:12.1.0
-    container_name: eb-grafana
-    restart: unless-stopped
-    environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set in .env}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
-      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001}
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-    ports:
-      - "127.0.0.1:3001:3000"
-    depends_on:
-      prometheus:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    networks: [obs-net]
-    logging: *default-logging
-
-  postgres-exporter:
-    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
-    container_name: eb-postgres-exporter
-    restart: unless-stopped
-    environment:
-      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks: [app-net, obs-net]
-    logging: *default-logging
-
-  kafka-exporter:
-    image: danielqsj/kafka-exporter:v1.9.0
-    container_name: eb-kafka-exporter
-    restart: unless-stopped
-    command: ["--kafka.server=kafka:9092"]
-    depends_on:
-      kafka:
-        condition: service_healthy
-    networks: [app-net, obs-net]
-    logging: *default-logging
+    logging: *logging
 
 networks:
-  app-net:
-    name: eb-app-net
-  obs-net:
-    name: eb-obs-net
+  app-net: { name: eb-app-net }
+  obs-net: { name: eb-obs-net }
 
 volumes:
-  postgres_data:
-  kafka_data:
-  prometheus_data:
-  grafana_data:
+  pgdata:
