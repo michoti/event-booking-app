@@ -16,14 +16,15 @@ import {
   uniqueIndex,
   uuid,
   varchar,
+  vector,
 } from "drizzle-orm/pg-core";
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
-// PostgreSQL 18 ships uuidv7(): time-ordered UUIDs, so B-tree inserts stay
-// append-mostly (far better index locality than random uuidv4).
+// Time-ordered UUIDs keep B-tree inserts append-mostly. PostgreSQL 18 ships uuidv7()
+// natively; migration 0000 installs a compatible shim on PG 15-17 (Supabase, PGlite).
 const pk = () => uuid("id").primaryKey().default(sql`uuidv7()`);
 
 const tz = (name: string) => timestamp(name, { withTimezone: true });
@@ -222,6 +223,10 @@ export const events = pgTable(
     endsAt: tz("ends_at").notNull(),
     timezone: varchar("timezone", { length: 64 }).notNull(),
     deletedAt: tz("deleted_at"),
+    // Semantic search (pgvector, free inside Supabase). 384 dims = gte-small / the offline hash embedder.
+    // `embeddingModel` stops two incompatible embedding spaces from being compared.
+    embedding: vector("embedding", { dimensions: 384 }),
+    embeddingModel: varchar("embedding_model", { length: 32 }),
     // Generated full-text column (title weighted above description).
     searchVector: tsvector("search_vector").generatedAlwaysAs(
       sql`setweight(to_tsvector('english', coalesce(title, '')), 'A') || setweight(to_tsvector('english', coalesce(description, '')), 'B')`,
@@ -235,6 +240,7 @@ export const events = pgTable(
     index("events_published_starts_idx")
       .on(t.startsAt)
       .where(sql`${t.status} = 'published' and ${t.deletedAt} is null`),
+    index("events_embedding_hnsw").using("hnsw", t.embedding.op("vector_cosine_ops")),
     index("events_organizer_idx").on(t.organizerId),
     index("events_venue_idx").on(t.venueId),
   ],

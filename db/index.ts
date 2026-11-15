@@ -1,31 +1,60 @@
-import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
+import type { Config } from "@/lib/config";
 import * as schema from "./schema";
 
-// Lazy initialisation: importing this module must NOT require DATABASE_URL,
-// because `next build` imports route modules without any runtime env present.
-const g = globalThis as unknown as {
-  __pgPool?: Pool;
-  __drizzle?: NodePgDatabase<typeof schema>;
+export type Db = PgDatabase<PgQueryResultHKT, typeof schema>;
+
+export type DbHandle = {
+  db: Db;
+  driver: "pg" | "pglite";
+  /** Cheap liveness probe used by /api/health/ready. */
+  ping(): Promise<void>;
+  close(): Promise<void>;
 };
 
-export function getPool(): Pool {
-  if (!g.__pgPool) {
-    const url = process.env.DATABASE_URL;
-    if (!url) throw new Error("DATABASE_URL is not set");
-    const pool = new Pool({
-      connectionString: url,
-      max: Number(process.env.DB_POOL_MAX ?? 10),
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 5_000,
-    });
-    pool.on("error", (err) => console.error("pg pool error", err));
-    g.__pgPool = pool;
+/**
+ * One factory, two drivers:
+ *  - "pg":     node-postgres -> Supabase (Supavisor transaction pooler) or Docker Postgres.
+ *  - "pglite": embedded Postgres (WASM) -> free, offline, zero install.
+ * Drivers are imported lazily so production never loads PGlite and `next build` never connects.
+ */
+export async function createDb(config: Config): Promise<DbHandle> {
+  if (config.dbDriver === "pglite") {
+    const { PGlite } = await import("@electric-sql/pglite");
+    const { vector } = await import("@electric-sql/pglite-pgvector");
+    const { drizzle } = await import("drizzle-orm/pglite");
+    if (!config.pgliteDir.includes("://")) (await import("node:fs")).mkdirSync(config.pgliteDir, { recursive: true });
+    const client = await PGlite.create(config.pgliteDir, { extensions: { vector } });
+    const db = drizzle({ client, schema }) as unknown as Db;
+    return {
+      db,
+      driver: "pglite",
+      ping: async () => void (await client.query("select 1")),
+      close: () => client.close(),
+    };
   }
-  return g.__pgPool;
+
+  if (!config.databaseUrl) throw new Error("DATABASE_URL is required when DB_DRIVER=pg");
+  const { Pool } = await import("pg");
+  const { drizzle } = await import("drizzle-orm/node-postgres");
+  const pool = new Pool({
+    connectionString: config.databaseUrl,
+    max: config.dbPoolMax,
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 5_000,
+    ...(config.dbSsl === "no-verify" ? { ssl: { rejectUnauthorized: false } } : {}),
+  });
+  pool.on("error", (e) => console.error("pg pool error", e.message));
+  const db = drizzle(pool, { schema }) as unknown as Db;
+  return {
+    db,
+    driver: "pg",
+    ping: async () => void (await pool.query("select 1")),
+    close: () => pool.end(),
+  };
 }
 
-export function getDb(): NodePgDatabase<typeof schema> {
-  if (!g.__drizzle) g.__drizzle = drizzle(getPool(), { schema });
-  return g.__drizzle;
+/** Both drivers return `{ rows }` from db.execute(). */
+export function rowsOf<T>(res: unknown): T[] {
+  return ((res as { rows?: T[] }).rows ?? []) as T[];
 }
